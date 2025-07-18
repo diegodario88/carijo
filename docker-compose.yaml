@@ -1,0 +1,69 @@
+services:
+  nginx:
+    image: nginx:1.25-alpine
+    container_name: balancer
+    volumes:
+      - ./nginx.conf:/etc/nginx/nginx.conf:ro
+    depends_on:
+      - white-carijo
+      - black-carijo
+    ports:
+      - "9999:9999"
+    networks:
+      - rinha-net
+    deploy:
+      resources:
+        limits:
+          cpus: "0.15"
+          memory: "15MB"
+  redis:
+    image: redis:7.2-alpine
+    container_name: storage
+    command: redis-server --save "" --appendonly no --maxclients 20000
+    networks:
+      - rinha-net
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    deploy:
+      resources:
+        limits:
+          cpus: "0.25"
+          memory: "275MB"
+  white-carijo: &rooster
+    build:
+      context: .
+      dockerfile: Dockerfile
+    hostname: white-carijo
+    container_name: white-carijo
+    stop_grace_period: 20s
+    environment:
+      - PROCESSOR_DEFAULT_URL=http://payment-processor-default:8080
+      - PROCESSOR_FALLBACK_URL=http://payment-processor-fallback:8080
+    networks:
+      - rinha-net
+      - payment-processor-net
+    depends_on:
+      redis:
+        condition: service_healthy
+    deploy:
+      resources:
+        limits:
+          cpus: "0.55"
+          memory: "30MB"
+    volumes:
+      - ./:/app:z
+    restart: unless-stopped
+
+  black-carijo:
+    <<: *rooster
+    hostname: black-carijo
+    container_name: black-carijo
+networks:
+  rinha-net:
+    driver: bridge
+  payment-processor-net:
+    name: payment-processor
+    external: true
