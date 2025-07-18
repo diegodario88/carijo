@@ -1,0 +1,3 @@
+[submodule "rinha-de-backend-2025"]
+	path = challenge
+	url = https://github.com/zanfranceschi/rinha-de-backend-2025
