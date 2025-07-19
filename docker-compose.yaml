@@ -15,7 +15,7 @@ services:
       resources:
         limits:
           cpus: "0.15"
-          memory: "15MB"
+          memory: "25MB"
   redis:
     image: redis:7.2-alpine
     container_name: storage
@@ -31,7 +31,7 @@ services:
       resources:
         limits:
           cpus: "0.25"
-          memory: "275MB"
+          memory: "200MB"
   white-carijo: &rooster
     build:
       context: .
@@ -52,7 +52,7 @@ services:
       resources:
         limits:
           cpus: "0.55"
-          memory: "30MB"
+          memory: "60MB"
     volumes:
       - ./:/app:z
     restart: unless-stopped
