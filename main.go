@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/diegodario88/carijo/cmd/api"
+	"github.com/diegodario88/carijo/cmd/health"
 	"github.com/diegodario88/carijo/cmd/worker"
 	"github.com/redis/go-redis/v9"
 )
@@ -27,6 +28,7 @@ func main() {
 	var wg sync.WaitGroup
 	httpServer := api.NewHttpServer(rdb)
 	paymentWorker := worker.NewPaymentWorker(rdb)
+	healthChecker := health.NewHealthChecker(rdb)
 
 	wg.Add(1)
 	go func() {
@@ -44,6 +46,20 @@ func main() {
 		}
 		log.Println("Worker desligado com sucesso.")
 	}()
+
+	if paymentWorker.Consumer == "black-carijo" {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			worker.DLQReanimator(ctx, rdb)
+		}()
+	} else {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			healthChecker.Run(ctx)
+		}()
+	}
 
 	<-ctx.Done()
 
