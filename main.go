@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/diegodario88/carijo/cmd/api"
+	"github.com/diegodario88/carijo/cmd/worker"
 	"github.com/redis/go-redis/v9"
 )
 
@@ -25,7 +26,7 @@ func main() {
 
 	var wg sync.WaitGroup
 	httpServer := api.NewHttpServer(rdb)
-	// worker := worker.New() // Futuro worker sera inicializado aqui.
+	paymentWorker := worker.NewPaymentWorker(rdb)
 
 	wg.Add(1)
 	go func() {
@@ -35,16 +36,14 @@ func main() {
 		}
 	}()
 
-	// wg.Add(1)
-	// go func() {
-	// 	  defer wg.Done()
-	//    log.Println("Worker iniciando...")
-	// 	  // Supondo que o worker tenha um método Run que aceita um contexto
-	// 	  // para saber quando parar.
-	// 	  if err := worker.Run(ctx); err != nil {
-	// 		  log.Printf("Worker foi finalizado com erro: %v", err)
-	//    }
-	// }()
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		if err := paymentWorker.Run(ctx); err != nil {
+			log.Printf("Worker foi finalizado com erro: %v", err)
+		}
+		log.Println("Worker desligado com sucesso.")
+	}()
 
 	<-ctx.Done()
 
@@ -59,12 +58,7 @@ func main() {
 		log.Println("Servidor Http desligado com sucesso.")
 	}
 
-	// if err := worker.Shutdown(shutdownCtx); err != nil {
-	// 	  log.Printf("Erro no desligamento do Worker: %v", err)
-	// } else {
-	//    log.Println("Worker desligado com sucesso.")
-	// }
-
+	log.Println("Aguardando todos os serviços finalizarem...")
 	wg.Wait()
 
 	log.Println("Desligando cliente Redis...")
