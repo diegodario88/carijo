@@ -9,19 +9,21 @@ import (
 
 	"github.com/gofiber/fiber/v3"
 	"github.com/redis/go-redis/v9"
+	"github.com/shopspring/decimal"
 )
 
 const sortedSetKey = "payments:log"
 const streamName = "payments_stream"
 
 type PaymentRequest struct {
-	CorrelationID string  `json:"correlationId"`
-	Amount        float64 `json:"amount"`
+	CorrelationID string          `json:"correlationId"`
+	Amount        decimal.Decimal `json:"amount"`
 }
 
 type PaymentLogEntry struct {
-	Processor string  `json:"processor"`
-	Amount    float64 `json:"amount"`
+	CorrelationID string          `json:"correlationId"`
+	Processor     string          `json:"processor"`
+	Amount        decimal.Decimal `json:"amount"`
 }
 
 type SummaryResponse struct {
@@ -82,6 +84,9 @@ func NewHttpServer(db *redis.Client) *HttpServer {
 		}
 
 		var resp SummaryResponse
+		totalAmountDefault := decimal.Zero
+		totalAmountFallback := decimal.Zero
+
 		for _, entryJSON := range logEntries {
 			var entry PaymentLogEntry
 			if err := json.Unmarshal([]byte(entryJSON), &entry); err != nil {
@@ -92,18 +97,25 @@ func NewHttpServer(db *redis.Client) *HttpServer {
 			switch entry.Processor {
 			case "default":
 				resp.Default.TotalRequests++
-				resp.Default.TotalAmount += entry.Amount
+				totalAmountDefault = totalAmountDefault.Add(entry.Amount)
 			case "fallback":
 				resp.Fallback.TotalRequests++
-				resp.Fallback.TotalAmount += entry.Amount
+				totalAmountFallback = totalAmountFallback.Add(entry.Amount)
 			}
 		}
+
+		resp.Default.TotalAmount, _ = totalAmountDefault.Float64()
+		resp.Fallback.TotalAmount, _ = totalAmountFallback.Float64()
 
 		return c.Status(fiber.StatusOK).JSON(resp)
 	})
 
 	app.Post("/purge-payments", func(c fiber.Ctx) error {
-		if err := db.Del(c.Context(), streamName, sortedSetKey).Err(); err != nil {
+		pipe := db.Pipeline()
+		pipe.Del(c.Context(), sortedSetKey)
+		pipe.XTrimMaxLen(c.Context(), streamName, 0)
+
+		if _, err := pipe.Exec(c.Context()); err != nil {
 			log.Printf("Erro ao purgar dados do Redis: %v", err)
 			return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
 				"error": "falha ao limpar os dados",
