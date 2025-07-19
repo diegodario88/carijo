@@ -7,37 +7,43 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"net"
 	"net/http"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 
+	"github.com/diegodario88/carijo/pkg/utils"
 	"github.com/redis/go-redis/v9"
+	"github.com/shopspring/decimal"
 )
 
 const streamName = "payments_stream"
 const groupName = "payment_processors"
 const sortedSetKey = "payments:log"
+const dlqKey = "dead_letter_queue"
 
 type PaymentRequest struct {
-	CorrelationID string  `json:"correlationId"`
-	Amount        float64 `json:"amount"`
+	CorrelationID string          `json:"correlationId"`
+	Amount        decimal.Decimal `json:"amount"`
 }
 
 type PaymentProcessorRequest struct {
-	CorrelationID string    `json:"correlationId"`
-	Amount        float64   `json:"amount"`
-	RequestedAt   time.Time `json:"requestedAt"`
+	CorrelationID string          `json:"correlationId"`
+	Amount        decimal.Decimal `json:"amount"`
+	RequestedAt   string          `json:"requestedAt"`
 }
 
 type PaymentLogEntry struct {
-	Processor string  `json:"processor"`
-	Amount    float64 `json:"amount"`
+	CorrelationID string          `json:"correlationId"`
+	Processor     string          `json:"processor"`
+	Amount        decimal.Decimal `json:"amount"`
 }
 
 type Worker struct {
+	Consumer             string
 	db                   *redis.Client
-	consumer             string
 	processorDefaultURL  string
 	processorFallbackURL string
 	httpClient           *http.Client
@@ -49,17 +55,34 @@ func NewPaymentWorker(db *redis.Client) *Worker {
 		hostname = "unknown"
 	}
 	return &Worker{
+		Consumer: hostname,
 		db:       db,
-		consumer: hostname,
-		processorDefaultURL: getEnv(
+		processorDefaultURL: utils.GetEnv(
 			"PROCESSOR_DEFAULT_URL",
 			"http://payment-processor-default:8080/payments",
 		),
-		processorFallbackURL: getEnv(
+		processorFallbackURL: utils.GetEnv(
 			"PROCESSOR_FALLBACK_URL",
 			"http://payment-processor-fallback:8080/payments",
 		),
-		httpClient: &http.Client{Timeout: 10 * time.Second},
+		httpClient: &http.Client{
+			Timeout: 10 * time.Second,
+			Transport: &http.Transport{
+				MaxIdleConns:        30,
+				MaxIdleConnsPerHost: 15,
+				IdleConnTimeout:     120 * time.Second,
+				MaxConnsPerHost:     20,
+				DisableCompression:  true,
+				DisableKeepAlives:   false,
+				ForceAttemptHTTP2:   false,
+
+				DialContext: (&net.Dialer{
+					Timeout:   2 * time.Second,
+					KeepAlive: 30 * time.Second,
+					DualStack: true,
+				}).DialContext,
+			},
+		},
 	}
 }
 
@@ -67,7 +90,7 @@ func (w *Worker) Run(ctx context.Context) error {
 	w.createConsumerGroup(ctx)
 	log.Printf(
 		"Worker '%s' iniciando, lendo da stream '%s' no grupo '%s'",
-		w.consumer,
+		w.Consumer,
 		streamName,
 		groupName,
 	)
@@ -95,9 +118,11 @@ func (w *Worker) createConsumerGroup(ctx context.Context) {
 
 func (w *Worker) readAndProcessMessage(ctx context.Context) error {
 	streams, err := w.db.XReadGroup(ctx, &redis.XReadGroupArgs{
-		Group: groupName, Consumer: w.consumer,
-		Streams: []string{streamName, ">"},
-		Count:   1, Block: 2 * time.Second,
+		Group:    groupName,
+		Consumer: w.Consumer,
+		Streams:  []string{streamName, ">"},
+		Count:    1, // Processamento sequencial
+		Block:    2 * time.Second,
 	}).Result()
 	if err != nil {
 		return err
@@ -113,15 +138,22 @@ func (w *Worker) readAndProcessMessage(ctx context.Context) error {
 				continue
 			}
 
-			log.Printf("Worker '%s' recebeu pagamento %s", w.consumer, req.CorrelationID)
 			processorUsed, err := w.processPayment(ctx, req)
 			if err != nil {
-				log.Printf("ERRO CRÍTICO: Falha ao processar %s: %v", req.CorrelationID, err)
+				log.Printf(
+					"ERRO CRÍTICO: Falha ao processar %s. Movendo para DLQ.",
+					req.CorrelationID,
+				)
+				w.db.LPush(ctx, dlqKey, payload)
 				w.db.XAck(ctx, streamName, groupName, message.ID)
 				continue
 			}
 
-			logEntry := PaymentLogEntry{Processor: processorUsed, Amount: req.Amount}
+			logEntry := PaymentLogEntry{
+				CorrelationID: req.CorrelationID,
+				Processor:     processorUsed,
+				Amount:        req.Amount,
+			}
 			logEntryJSON, _ := json.Marshal(logEntry)
 
 			member := redis.Z{
@@ -130,40 +162,81 @@ func (w *Worker) readAndProcessMessage(ctx context.Context) error {
 			}
 
 			if err := w.db.ZAdd(ctx, sortedSetKey, member).Err(); err != nil {
-				log.Printf("ERRO: Falha ao salvar log do pagamento %s: %v", req.CorrelationID, err)
-				return err // Não dá ACK, permite reprocessamento.
+				log.Printf(
+					"ERRO CRÍTICO: Falha ao salvar log do pagamento %s. Movendo para DLQ.",
+					req.CorrelationID,
+				)
+				w.db.LPush(ctx, dlqKey, payload)
+				w.db.XAck(ctx, streamName, groupName, message.ID)
+				continue
 			}
 
 			w.db.XAck(ctx, streamName, groupName, message.ID)
-			log.Printf(
-				"Pagamento %s processado via '%s' e log salvo.",
-				req.CorrelationID,
-				processorUsed,
-			)
 		}
 	}
 	return nil
 }
 
 func (w *Worker) processPayment(ctx context.Context, req PaymentRequest) (string, error) {
+	const decisionThreshold = 150 // ms
+
 	processorReq := PaymentProcessorRequest{
 		CorrelationID: req.CorrelationID,
 		Amount:        req.Amount,
-		RequestedAt:   time.Now().UTC(),
+		RequestedAt:   time.Now().UTC().Format(time.RFC3339Nano),
 	}
 
-	err := w.callPaymentProcessor(ctx, w.processorDefaultURL, processorReq)
-	if err == nil {
-		return "default", nil
+	// Busca o status de ambos os processadores com MGet
+	healthKeys := []string{
+		"health:default:failing",
+		"health:default:minResponseTime",
+		"health:fallback:failing",
 	}
-	log.Printf("AVISO: Falha no Default para %s: %v. Tentando Fallback...", req.CorrelationID, err)
-
-	err = w.callPaymentProcessor(ctx, w.processorFallbackURL, processorReq)
-	if err == nil {
-		return "fallback", nil
+	results, err := w.db.MGet(ctx, healthKeys...).Result()
+	if err != nil {
+		log.Printf("AVISO: Falha ao buscar health status no Redis: %v. Tentando Default.", err)
+		if err := w.callPaymentProcessor(ctx, w.processorDefaultURL, processorReq); err == nil {
+			return "default", nil
+		}
+		return "", fmt.Errorf("falha ao buscar status e ao tentar processador default")
 	}
-	log.Printf("ERRO: Falha no Fallback para %s: %v.", req.CorrelationID, err)
 
+	isDefaultFailing := results[0] != nil && results[0].(string) == "true"
+
+	var defaultResponseTime int
+	if results[1] != nil {
+		defaultResponseTime, _ = strconv.Atoi(results[1].(string))
+	}
+
+	isFallbackFailing := results[2] != nil && results[2].(string) == "true"
+
+	// Lógica de decisão
+	useDefault := true
+	if isDefaultFailing {
+		useDefault = false
+	} else if defaultResponseTime > decisionThreshold {
+		useDefault = false
+	}
+
+	if useDefault {
+		if err := w.callPaymentProcessor(ctx, w.processorDefaultURL, processorReq); err == nil {
+			return "default", nil
+		}
+		if err := w.callPaymentProcessor(ctx, w.processorFallbackURL, processorReq); err == nil {
+			return "fallback", nil
+		}
+	} else {
+		if !isFallbackFailing {
+			if err := w.callPaymentProcessor(ctx, w.processorFallbackURL, processorReq); err == nil {
+				return "fallback", nil
+			}
+		}
+		if err := w.callPaymentProcessor(ctx, w.processorDefaultURL, processorReq); err == nil {
+			return "default", nil
+		}
+	}
+
+	log.Printf("ERRO: Ambos os processadores falharam para o pagamento %s.", req.CorrelationID)
 	return "", fmt.Errorf("ambos os processadores falharam")
 }
 
@@ -192,10 +265,36 @@ func (w *Worker) callPaymentProcessor(
 	return nil
 }
 
-func getEnv(key, fallback string) string {
-	if value, ok := os.LookupEnv(key); ok {
-		return value
-	}
-	return fallback
-}
+func DLQReanimator(ctx context.Context, db *redis.Client) {
+	log.Println("Reanimador da DLQ iniciando...")
+	ticker := time.NewTicker(5 * time.Second)
+	defer ticker.Stop()
 
+	for {
+		select {
+		case <-ctx.Done():
+			log.Println("Reanimador da DLQ desligando.")
+			return
+		case <-ticker.C:
+			payload, err := db.RPop(ctx, dlqKey).Result()
+			if err == redis.Nil {
+				continue
+			}
+			if err != nil {
+				log.Printf("Erro ao ler da DLQ: %v", err)
+				continue
+			}
+
+			args := &redis.XAddArgs{
+				Stream: streamName,
+				Values: map[string]any{"payload": payload},
+			}
+			if err := db.XAdd(ctx, args).Err(); err != nil {
+				log.Printf("Erro ao re-enfileirar mensagem da DLQ: %v", err)
+				db.LPush(ctx, dlqKey, payload)
+			} else {
+				log.Printf("Mensagem da DLQ re-enfileirada com sucesso.")
+			}
+		}
+	}
+}
