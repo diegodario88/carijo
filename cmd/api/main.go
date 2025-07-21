@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"log"
-	"strconv"
 	"time"
 
 	"github.com/gofiber/fiber/v3"
@@ -12,18 +11,31 @@ import (
 	"github.com/shopspring/decimal"
 )
 
-const sortedSetKey = "payments:log"
 const streamName = "payments_stream"
+const paymentsHashKey = "payments"
 
 type PaymentRequest struct {
 	CorrelationID string          `json:"correlationId"`
 	Amount        decimal.Decimal `json:"amount"`
 }
 
-type PaymentLogEntry struct {
+type ProcessedPayment struct {
 	CorrelationID string          `json:"correlationId"`
-	Processor     string          `json:"processor"`
 	Amount        decimal.Decimal `json:"amount"`
+	Processor     string          `json:"processor"`
+	Status        string          `json:"status"`
+	CreatedAt     string          `json:"createdAt"`
+}
+
+type summaryAggregator struct {
+	Default struct {
+		TotalRequests int64
+		TotalAmount   decimal.Decimal
+	}
+	Fallback struct {
+		TotalRequests int64
+		TotalAmount   decimal.Decimal
+	}
 }
 
 type SummaryResponse struct {
@@ -56,76 +68,69 @@ func NewHttpServer(db *redis.Client) *HttpServer {
 		payload, _ := json.Marshal(req)
 		args := &redis.XAddArgs{
 			Stream: streamName,
-			Values: map[string]interface{}{"payload": payload},
+			Values: map[string]any{"payload": payload},
 		}
 		if err := db.XAdd(c.Context(), args).Err(); err != nil {
 			log.Printf("Erro ao adicionar na stream: %v", err)
 			return c.Status(fiber.StatusInternalServerError).
 				JSON(fiber.Map{"error": "falha ao enfileirar"})
 		}
-		return c.Status(fiber.StatusAccepted).JSON(fiber.Map{"message": "pagamento recebido"})
+		return c.Status(fiber.StatusAccepted).SendString("")
 	})
 
 	app.Get("/payments-summary", func(c fiber.Ctx) error {
-		from, to, err := parseTimeRange(c)
-		if err != nil {
-			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": err.Error()})
+		fromStr := c.Query("from")
+		toStr := c.Query("to")
+		useFilter := fromStr != "" && toStr != ""
+
+		var from, to time.Time
+		var err error
+		if useFilter {
+			from, err = time.Parse(time.RFC3339Nano, fromStr)
+			if err != nil {
+				return c.Status(fiber.StatusBadRequest).
+					JSON(fiber.Map{"error": "formato de timestamp 'from' invalido"})
+			}
+			to, err = time.Parse(time.RFC3339Nano, toStr)
+			if err != nil {
+				return c.Status(fiber.StatusBadRequest).
+					JSON(fiber.Map{"error": "formato de timestamp 'to' invalido"})
+			}
 		}
 
-		logEntries, err := db.ZRangeByScore(c.Context(), sortedSetKey, &redis.ZRangeBy{
-			Min: from,
-			Max: to,
-		}).Result()
-
+		paymentsData, err := db.HGetAll(c.Context(), paymentsHashKey).Result()
 		if err != nil {
 			log.Printf("Erro ao buscar dados do summary no Redis: %v", err)
 			return c.Status(fiber.StatusInternalServerError).
 				JSON(fiber.Map{"error": "falha ao buscar resumo"})
 		}
 
-		var resp SummaryResponse
-		totalAmountDefault := decimal.Zero
-		totalAmountFallback := decimal.Zero
+		aggregator := summarizePayments(paymentsData, from, to, useFilter)
 
-		for _, entryJSON := range logEntries {
-			var entry PaymentLogEntry
-			if err := json.Unmarshal([]byte(entryJSON), &entry); err != nil {
-				log.Printf("AVISO: Falha ao decodificar entrada do log: %v", err)
-				continue
-			}
-
-			switch entry.Processor {
-			case "default":
-				resp.Default.TotalRequests++
-				totalAmountDefault = totalAmountDefault.Add(entry.Amount)
-			case "fallback":
-				resp.Fallback.TotalRequests++
-				totalAmountFallback = totalAmountFallback.Add(entry.Amount)
-			}
-		}
-
-		resp.Default.TotalAmount, _ = totalAmountDefault.Float64()
-		resp.Fallback.TotalAmount, _ = totalAmountFallback.Float64()
+		resp := SummaryResponse{}
+		resp.Default.TotalRequests = aggregator.Default.TotalRequests
+		resp.Default.TotalAmount, _ = aggregator.Default.TotalAmount.Float64()
+		resp.Fallback.TotalRequests = aggregator.Fallback.TotalRequests
+		resp.Fallback.TotalAmount, _ = aggregator.Fallback.TotalAmount.Float64()
 
 		return c.Status(fiber.StatusOK).JSON(resp)
 	})
 
-	app.Post("/purge-payments", func(c fiber.Ctx) error {
+	app.Post("/purge-all-data", func(c fiber.Ctx) error {
 		pipe := db.Pipeline()
-		pipe.Del(c.Context(), sortedSetKey)
-		pipe.XTrimMaxLen(c.Context(), streamName, 0)
+		pipe.Del(c.Context(), paymentsHashKey)
+		pipe.Del(c.Context(), streamName)
+		pipe.Del(c.Context(), "health:default:failing", "health:default:minResponseTime")
+		pipe.Del(c.Context(), "health:fallback:failing", "health:fallback:minResponseTime")
 
 		if _, err := pipe.Exec(c.Context()); err != nil {
 			log.Printf("Erro ao purgar dados do Redis: %v", err)
-			return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
-				"error": "falha ao limpar os dados",
-			})
+			return c.Status(fiber.StatusInternalServerError).
+				JSON(fiber.Map{"error": "falha ao limpar os dados"})
 		}
 
-		log.Println("Dados de pagamento purgados com sucesso.")
-		return c.Status(fiber.StatusOK).JSON(fiber.Map{
-			"message": "todos os dados de pagamento foram purgados",
-		})
+		log.Println("Todos os dados foram purgados com sucesso.")
+		return c.Status(fiber.StatusOK).JSON(fiber.Map{"message": "todos os dados foram purgados"})
 	})
 
 	return &HttpServer{
@@ -135,31 +140,37 @@ func NewHttpServer(db *redis.Client) *HttpServer {
 	}
 }
 
-func parseTimeRange(c fiber.Ctx) (string, string, error) {
-	fromStr := c.Query("from")
-	toStr := c.Query("to")
+func summarizePayments(
+	paymentsData map[string]string,
+	from, to time.Time,
+	useFilter bool,
+) summaryAggregator {
+	agg := summaryAggregator{}
+	agg.Default.TotalAmount = decimal.Zero
+	agg.Fallback.TotalAmount = decimal.Zero
 
-	if fromStr == "" {
-		fromStr = "-inf"
-	} else {
-		t, err := time.Parse(time.RFC3339Nano, fromStr)
-		if err != nil {
-			return "", "", fiber.NewError(fiber.StatusBadRequest, "formato de timestamp 'from' invalido")
+	for _, paymentDataStr := range paymentsData {
+		var payment ProcessedPayment
+		if err := json.Unmarshal([]byte(paymentDataStr), &payment); err != nil {
+			continue
 		}
-		fromStr = strconv.FormatInt(t.UnixMilli(), 10)
-	}
 
-	if toStr == "" {
-		toStr = "+inf"
-	} else {
-		t, err := time.Parse(time.RFC3339Nano, toStr)
-		if err != nil {
-			return "", "", fiber.NewError(fiber.StatusBadRequest, "formato de timestamp 'to' invalido")
+		if useFilter {
+			createdAt, err := time.Parse(time.RFC3339Nano, payment.CreatedAt)
+			if err != nil || createdAt.Before(from) || createdAt.After(to) {
+				continue
+			}
 		}
-		toStr = strconv.FormatInt(t.UnixMilli(), 10)
-	}
 
-	return fromStr, toStr, nil
+		if payment.Processor == "DEFAULT" && payment.Status == "PROCESSED_DEFAULT" {
+			agg.Default.TotalRequests++
+			agg.Default.TotalAmount = agg.Default.TotalAmount.Add(payment.Amount)
+		} else if payment.Processor == "FALLBACK" && payment.Status == "PROCESSED_FALLBACK" {
+			agg.Fallback.TotalRequests++
+			agg.Fallback.TotalAmount = agg.Fallback.TotalAmount.Add(payment.Amount)
+		}
+	}
+	return agg
 }
 
 func (api *HttpServer) Run() error {

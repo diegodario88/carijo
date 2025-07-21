@@ -12,6 +12,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/diegodario88/carijo/pkg/utils"
@@ -21,8 +22,8 @@ import (
 
 const streamName = "payments_stream"
 const groupName = "payment_processors"
-const sortedSetKey = "payments:log"
-const dlqKey = "dead_letter_queue"
+const paymentsHashKey = "payments"
+const fallbackThreshold = 0.1176
 
 type PaymentRequest struct {
 	CorrelationID string          `json:"correlationId"`
@@ -35,10 +36,19 @@ type PaymentProcessorRequest struct {
 	RequestedAt   string          `json:"requestedAt"`
 }
 
-type PaymentLogEntry struct {
+type ProcessedPayment struct {
 	CorrelationID string          `json:"correlationId"`
-	Processor     string          `json:"processor"`
 	Amount        decimal.Decimal `json:"amount"`
+	Processor     string          `json:"processor"`
+	Status        string          `json:"status"`
+	CreatedAt     string          `json:"createdAt"`
+}
+
+type HealthInfo struct {
+	DefaultFailing          bool
+	DefaultMinResponseTime  int
+	FallbackFailing         bool
+	FallbackMinResponseTime int
 }
 
 type Worker struct {
@@ -55,7 +65,7 @@ func NewPaymentWorker(db *redis.Client) *Worker {
 		hostname = "unknown"
 	}
 	return &Worker{
-		Consumer: hostname,
+		Consumer: fmt.Sprintf("%s-%d", hostname, time.Now().UnixNano()),
 		db:       db,
 		processorDefaultURL: utils.GetEnv(
 			"PROCESSOR_DEFAULT_URL",
@@ -68,45 +78,87 @@ func NewPaymentWorker(db *redis.Client) *Worker {
 		httpClient: &http.Client{
 			Timeout: 10 * time.Second,
 			Transport: &http.Transport{
-				MaxIdleConns:        30,
-				MaxIdleConnsPerHost: 15,
-				IdleConnTimeout:     120 * time.Second,
-				MaxConnsPerHost:     20,
+				MaxIdleConns:        100,
 				DisableCompression:  true,
-				DisableKeepAlives:   false,
-				ForceAttemptHTTP2:   false,
-
+				MaxIdleConnsPerHost: 50,
+				IdleConnTimeout:     120 * time.Second,
+				MaxConnsPerHost:     50,
 				DialContext: (&net.Dialer{
 					Timeout:   2 * time.Second,
 					KeepAlive: 30 * time.Second,
-					DualStack: true,
 				}).DialContext,
 			},
 		},
 	}
 }
 
-func (w *Worker) Run(ctx context.Context) error {
-	w.createConsumerGroup(ctx)
-	log.Printf(
-		"Worker '%s' iniciando, lendo da stream '%s' no grupo '%s'",
-		w.Consumer,
-		streamName,
-		groupName,
-	)
+func (w *Worker) paymentProcessorWorker(ctx context.Context, workerID int) {
 	for {
 		select {
 		case <-ctx.Done():
-			log.Println("Worker recebendo sinal de desligamento...")
-			return nil
+			log.Printf("Worker goroutine %d for consumer %s desligando", workerID, w.Consumer)
+			return
 		default:
-			err := w.readAndProcessMessage(ctx)
-			if err != nil && !errors.Is(err, redis.Nil) {
-				log.Printf("Erro ao processar mensagem: %v. Aguardando...", err)
-				time.Sleep(1 * time.Second)
+			streams, err := w.db.XReadGroup(ctx, &redis.XReadGroupArgs{
+				Group:    groupName,
+				Consumer: w.Consumer,
+				Streams:  []string{streamName, ">"},
+				Count:    1,
+				Block:    2 * time.Second,
+			}).Result()
+
+			if err != nil {
+				if !errors.Is(err, redis.Nil) && !errors.Is(err, context.Canceled) {
+					log.Printf("[Worker %d] Erro ao ler da stream: %v", workerID, err)
+				}
+				continue
 			}
+
+			if len(streams) == 0 || len(streams[0].Messages) == 0 {
+				continue
+			}
+
+			message := streams[0].Messages[0]
+			payload := message.Values["payload"].(string)
+			var req PaymentRequest
+			if err := json.Unmarshal([]byte(payload), &req); err != nil {
+				log.Printf(
+					"[Worker %d] Erro ao decodificar payload, descartando: %v",
+					workerID,
+					err,
+				)
+				w.db.XAck(ctx, streamName, groupName, message.ID)
+				continue
+			}
+
+			if err := w.processPayment(ctx, req); err != nil {
+				continue
+			}
+
+			w.db.XAck(ctx, streamName, groupName, message.ID)
 		}
 	}
+}
+
+func (w *Worker) Run(ctx context.Context) error {
+	w.createConsumerGroup(ctx)
+	concurrency, _ := strconv.Atoi(utils.GetEnv("WORKER_CONCURRENCY", "2"))
+
+	var wg sync.WaitGroup
+
+	for i := 1; i <= concurrency; i++ {
+		wg.Add(1)
+		go func(workerNum int) {
+			defer wg.Done()
+			w.paymentProcessorWorker(ctx, workerNum)
+		}(i)
+	}
+
+	<-ctx.Done()
+	log.Println("Sinal de desligamento recebido, aguardando workers finalizarem...")
+	wg.Wait()
+	log.Println("Todos os workers finalizaram.")
+	return nil
 }
 
 func (w *Worker) createConsumerGroup(ctx context.Context) {
@@ -116,185 +168,108 @@ func (w *Worker) createConsumerGroup(ctx context.Context) {
 	}
 }
 
-func (w *Worker) readAndProcessMessage(ctx context.Context) error {
-	streams, err := w.db.XReadGroup(ctx, &redis.XReadGroupArgs{
-		Group:    groupName,
-		Consumer: w.Consumer,
-		Streams:  []string{streamName, ">"},
-		Count:    1, // Processamento sequencial
-		Block:    2 * time.Second,
-	}).Result()
+func (w *Worker) processPayment(ctx context.Context, req PaymentRequest) error {
+	health, err := w.retrieveHealthStates(ctx)
 	if err != nil {
-		return err
+		return fmt.Errorf("falha ao buscar status de saude: %w", err)
 	}
 
-	for _, stream := range streams {
-		for _, message := range stream.Messages {
-			payload := message.Values["payload"].(string)
-			var req PaymentRequest
-			if err := json.Unmarshal([]byte(payload), &req); err != nil {
-				log.Printf("Erro ao decodificar payload: %v. Mensagem: %s", err, payload)
-				w.db.XAck(ctx, streamName, groupName, message.ID)
-				continue
-			}
+	processorURL := w.processorDefaultURL
+	processorType := "DEFAULT"
+	status := "PROCESSED_DEFAULT"
+	useFallback := health.DefaultFailing
 
-			processorUsed, err := w.processPayment(ctx, req)
-			if err != nil {
-				log.Printf(
-					"ERRO CRÍTICO: Falha ao processar %s. Movendo para DLQ.",
-					req.CorrelationID,
-				)
-				w.db.LPush(ctx, dlqKey, payload)
-				w.db.XAck(ctx, streamName, groupName, message.ID)
-				continue
-			}
+	if !useFallback && health.DefaultMinResponseTime > 0 && health.FallbackMinResponseTime > 0 {
+		defaultTime := decimal.NewFromInt(int64(health.DefaultMinResponseTime))
+		fallbackTime := decimal.NewFromInt(int64(health.FallbackMinResponseTime))
+		threshold := decimal.NewFromFloat(fallbackThreshold)
 
-			logEntry := PaymentLogEntry{
-				CorrelationID: req.CorrelationID,
-				Processor:     processorUsed,
-				Amount:        req.Amount,
-			}
-			logEntryJSON, _ := json.Marshal(logEntry)
+		advantage := defaultTime.Sub(fallbackTime).Div(defaultTime)
 
-			member := redis.Z{
-				Score:  float64(time.Now().UnixMilli()),
-				Member: logEntryJSON,
-			}
-
-			if err := w.db.ZAdd(ctx, sortedSetKey, member).Err(); err != nil {
-				log.Printf(
-					"ERRO CRÍTICO: Falha ao salvar log do pagamento %s. Movendo para DLQ.",
-					req.CorrelationID,
-				)
-				w.db.LPush(ctx, dlqKey, payload)
-				w.db.XAck(ctx, streamName, groupName, message.ID)
-				continue
-			}
-
-			w.db.XAck(ctx, streamName, groupName, message.ID)
+		if advantage.GreaterThan(threshold) {
+			useFallback = true
 		}
 	}
-	return nil
-}
 
-func (w *Worker) processPayment(ctx context.Context, req PaymentRequest) (string, error) {
-	const decisionThreshold = 150 // ms
+	if useFallback {
+		processorURL = w.processorFallbackURL
+		processorType = "FALLBACK"
+		status = "PROCESSED_FALLBACK"
+	}
 
-	processorReq := PaymentProcessorRequest{
+	requestedAt := time.Now().UTC().Format(time.RFC3339Nano)
+	body := PaymentProcessorRequest{
 		CorrelationID: req.CorrelationID,
 		Amount:        req.Amount,
-		RequestedAt:   time.Now().UTC().Format(time.RFC3339Nano),
+		RequestedAt:   requestedAt,
 	}
+	jsonBody, _ := json.Marshal(body)
 
-	// Busca o status de ambos os processadores com MGet
-	healthKeys := []string{
-		"health:default:failing",
-		"health:default:minResponseTime",
-		"health:fallback:failing",
-	}
-	results, err := w.db.MGet(ctx, healthKeys...).Result()
-	if err != nil {
-		log.Printf("AVISO: Falha ao buscar health status no Redis: %v. Tentando Default.", err)
-		if err := w.callPaymentProcessor(ctx, w.processorDefaultURL, processorReq); err == nil {
-			return "default", nil
-		}
-		return "", fmt.Errorf("falha ao buscar status e ao tentar processador default")
-	}
-
-	isDefaultFailing := results[0] != nil && results[0].(string) == "true"
-
-	var defaultResponseTime int
-	if results[1] != nil {
-		defaultResponseTime, _ = strconv.Atoi(results[1].(string))
-	}
-
-	isFallbackFailing := results[2] != nil && results[2].(string) == "true"
-
-	// Lógica de decisão
-	useDefault := true
-	if isDefaultFailing {
-		useDefault = false
-	} else if defaultResponseTime > decisionThreshold {
-		useDefault = false
-	}
-
-	if useDefault {
-		if err := w.callPaymentProcessor(ctx, w.processorDefaultURL, processorReq); err == nil {
-			return "default", nil
-		}
-		if err := w.callPaymentProcessor(ctx, w.processorFallbackURL, processorReq); err == nil {
-			return "fallback", nil
-		}
-	} else {
-		if !isFallbackFailing {
-			if err := w.callPaymentProcessor(ctx, w.processorFallbackURL, processorReq); err == nil {
-				return "fallback", nil
-			}
-		}
-		if err := w.callPaymentProcessor(ctx, w.processorDefaultURL, processorReq); err == nil {
-			return "default", nil
-		}
-	}
-
-	log.Printf("ERRO: Ambos os processadores falharam para o pagamento %s.", req.CorrelationID)
-	return "", fmt.Errorf("ambos os processadores falharam")
-}
-
-func (w *Worker) callPaymentProcessor(
-	ctx context.Context,
-	url string,
-	req PaymentProcessorRequest,
-) error {
-	payloadBytes, err := json.Marshal(req)
-	if err != nil {
-		return fmt.Errorf("falha no marshal: %w", err)
-	}
-	httpReq, err := http.NewRequestWithContext(ctx, "POST", url, bytes.NewBuffer(payloadBytes))
+	httpReq, err := http.NewRequestWithContext(ctx, "POST", processorURL, bytes.NewReader(jsonBody))
 	if err != nil {
 		return fmt.Errorf("falha ao criar http request: %w", err)
 	}
 	httpReq.Header.Set("Content-Type", "application/json")
+
 	resp, err := w.httpClient.Do(httpReq)
 	if err != nil {
 		return fmt.Errorf("falha na chamada http: %w", err)
 	}
 	defer resp.Body.Close()
-	if resp.StatusCode >= 400 {
-		return fmt.Errorf("status de erro: %d", resp.StatusCode)
+
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		w.db.Set(ctx, "health:"+strings.ToLower(processorType)+":failing", "true", 10*time.Second)
+		return fmt.Errorf("processador retornou status não-2xx: %s", resp.Status)
 	}
+
+	processedPayment := ProcessedPayment{
+		CorrelationID: req.CorrelationID,
+		Amount:        req.Amount,
+		Status:        status,
+		Processor:     processorType,
+		CreatedAt:     requestedAt,
+	}
+	paymentData, err := json.Marshal(processedPayment)
+	if err != nil {
+		return fmt.Errorf("falha ao serializar dados do pagamento: %w", err)
+	}
+
+	if err := w.db.HSet(ctx, paymentsHashKey, req.CorrelationID, paymentData).Err(); err != nil {
+		return fmt.Errorf("falha ao salvar pagamento no redis: %w", err)
+	}
+
 	return nil
 }
 
-func DLQReanimator(ctx context.Context, db *redis.Client) {
-	log.Println("Reanimador da DLQ iniciando...")
-	ticker := time.NewTicker(5 * time.Second)
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-ctx.Done():
-			log.Println("Reanimador da DLQ desligando.")
-			return
-		case <-ticker.C:
-			payload, err := db.RPop(ctx, dlqKey).Result()
-			if err == redis.Nil {
-				continue
-			}
-			if err != nil {
-				log.Printf("Erro ao ler da DLQ: %v", err)
-				continue
-			}
-
-			args := &redis.XAddArgs{
-				Stream: streamName,
-				Values: map[string]any{"payload": payload},
-			}
-			if err := db.XAdd(ctx, args).Err(); err != nil {
-				log.Printf("Erro ao re-enfileirar mensagem da DLQ: %v", err)
-				db.LPush(ctx, dlqKey, payload)
-			} else {
-				log.Printf("Mensagem da DLQ re-enfileirada com sucesso.")
-			}
-		}
+func (w *Worker) retrieveHealthStates(ctx context.Context) (*HealthInfo, error) {
+	keys := []string{
+		"health:default:failing",
+		"health:default:minResponseTime",
+		"health:fallback:failing",
+		"health:fallback:minResponseTime",
 	}
+	results, err := w.db.MGet(ctx, keys...).Result()
+	if err != nil {
+		return &HealthInfo{DefaultFailing: false, FallbackFailing: false}, nil
+	}
+
+	health := &HealthInfo{}
+
+	if len(results) > 0 && results[0] != nil {
+		health.DefaultFailing, _ = strconv.ParseBool(results[0].(string))
+	}
+	if len(results) > 1 && results[1] != nil {
+		val, _ := strconv.Atoi(results[1].(string))
+		health.DefaultMinResponseTime = val
+	}
+	if len(results) > 2 && results[2] != nil {
+		health.FallbackFailing, _ = strconv.ParseBool(results[2].(string))
+	}
+	if len(results) > 3 && results[3] != nil {
+		val, _ := strconv.Atoi(results[3].(string))
+		health.FallbackMinResponseTime = val
+	}
+
+	return health, nil
 }
+

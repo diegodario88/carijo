@@ -23,6 +23,7 @@ func main() {
 		Addr:     "storage:6379",
 		Password: "",
 		DB:       0,
+		PoolSize: 100,
 	})
 
 	var wg sync.WaitGroup
@@ -47,13 +48,7 @@ func main() {
 		log.Println("Worker desligado com sucesso.")
 	}()
 
-	if paymentWorker.Consumer == "black-carijo" {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			worker.DLQReanimator(ctx, rdb)
-		}()
-	} else {
+	if paymentWorker.Consumer == "white-carijo" {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
@@ -65,7 +60,7 @@ func main() {
 
 	log.Println("Sinal de desligamento recebido. Iniciando graceful shutdown...")
 
-	shutdownCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
 	if err := httpServer.Shutdown(shutdownCtx); err != nil {
@@ -84,3 +79,4 @@ func main() {
 
 	log.Println("Processo de desligamento foi completo com sucesso!")
 }
+
