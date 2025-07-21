@@ -1,3 +1,7 @@
+<p align="center">
+<img width="300" alt="cropped_circle_image" src="https://github.com/user-attachments/assets/bd89d465-c7f0-4828-9eec-30b7008ee498" />
+</p>
+
 # Carijó - Rinha de Backend 2025
 
 Este repositório contém a minha implementação para a [3ª edição da Rinha de Backend](https://github.com/zanfranceschi/rinha-de-backend-2025).
