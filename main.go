@@ -54,6 +54,12 @@ func main() {
 			defer wg.Done()
 			healthChecker.Run(ctx)
 		}()
+	} else {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			paymentWorker.RunJanitor(ctx)
+		}()
 	}
 
 	<-ctx.Done()
@@ -79,4 +85,3 @@ func main() {
 
 	log.Println("Processo de desligamento foi completo com sucesso!")
 }
-
