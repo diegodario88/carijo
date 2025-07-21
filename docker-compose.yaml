@@ -8,14 +8,16 @@ services:
       - white-carijo
       - black-carijo
     ports:
-      - "9999:9999"
+      - "9999:80"
+    tmpfs:
+      - /var/cache/nginx:size=50m
     networks:
       - rinha-net
     deploy:
       resources:
         limits:
-          cpus: "0.15"
-          memory: "25MB"
+          cpus: "0.2"
+          memory: "100MB"
   redis:
     image: redis:7.2-alpine
     container_name: storage
@@ -30,8 +32,8 @@ services:
     deploy:
       resources:
         limits:
-          cpus: "0.25"
-          memory: "200MB"
+          cpus: "0.3"
+          memory: "100MB"
   white-carijo: &rooster
     build:
       context: .
@@ -42,6 +44,7 @@ services:
     environment:
       - PROCESSOR_DEFAULT_URL=http://payment-processor-default:8080/payments
       - PROCESSOR_FALLBACK_URL=http://payment-processor-fallback:8080/payments
+      - WORKER_CONCURRENCY=7
     networks:
       - rinha-net
       - payment-processor-net
@@ -51,12 +54,11 @@ services:
     deploy:
       resources:
         limits:
-          cpus: "0.55"
-          memory: "60MB"
+          cpus: "0.5"
+          memory: "75MB"
     volumes:
       - ./:/app:z
     restart: unless-stopped
-
   black-carijo:
     <<: *rooster
     hostname: black-carijo
