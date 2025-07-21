@@ -23,7 +23,7 @@ import (
 const streamName = "payments_stream"
 const groupName = "payment_processors"
 const paymentsHashKey = "payments"
-const fallbackThreshold = 0.1176
+const fallbackThreshold = 0.8
 
 type PaymentRequest struct {
 	CorrelationID string          `json:"correlationId"`
@@ -272,4 +272,3 @@ func (w *Worker) retrieveHealthStates(ctx context.Context) (*HealthInfo, error) 
 
 	return health, nil
 }
-
