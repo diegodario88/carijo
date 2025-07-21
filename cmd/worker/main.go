@@ -3,6 +3,8 @@ package worker
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -19,6 +21,8 @@ import (
 	"github.com/redis/go-redis/v9"
 	"github.com/shopspring/decimal"
 )
+
+var hostname string = "unknown"
 
 const streamName = "payments_stream"
 const groupName = "payment_processors"
@@ -60,12 +64,10 @@ type Worker struct {
 }
 
 func NewPaymentWorker(db *redis.Client) *Worker {
-	hostname, err := os.Hostname()
-	if err != nil {
-		hostname = "unknown"
-	}
+	hostname, _ = os.Hostname()
+
 	return &Worker{
-		Consumer: fmt.Sprintf("%s-%d", hostname, time.Now().UnixNano()),
+		Consumer: hostname,
 		db:       db,
 		processorDefaultURL: utils.GetEnv(
 			"PROCESSOR_DEFAULT_URL",
@@ -99,9 +101,13 @@ func (w *Worker) paymentProcessorWorker(ctx context.Context, workerID int) {
 			log.Printf("Worker goroutine %d for consumer %s desligando", workerID, w.Consumer)
 			return
 		default:
+			randomBytes := make([]byte, 8)
+			rand.Read(randomBytes)
+			consumerID := fmt.Sprintf("%s-%s", hostname, hex.EncodeToString(randomBytes))
+
 			streams, err := w.db.XReadGroup(ctx, &redis.XReadGroupArgs{
 				Group:    groupName,
-				Consumer: w.Consumer,
+				Consumer: consumerID,
 				Streams:  []string{streamName, ">"},
 				Count:    1,
 				Block:    2 * time.Second,
@@ -159,6 +165,83 @@ func (w *Worker) Run(ctx context.Context) error {
 	wg.Wait()
 	log.Println("Todos os workers finalizaram.")
 	return nil
+}
+
+func (w *Worker) RunJanitor(ctx context.Context) {
+	w.createConsumerGroup(ctx)
+	w.Consumer = fmt.Sprintf("%s-janitor", w.Consumer)
+	ticker := time.NewTicker(1 * time.Second)
+	defer ticker.Stop()
+
+	log.Println("Iniciando worker em modo Janitor para reclamar mensagens pendentes...")
+
+	for {
+		select {
+		case <-ctx.Done():
+			log.Println("Janitor desligando.")
+			return
+		case <-ticker.C:
+			w.claimAndReprocess(ctx)
+		}
+	}
+}
+
+func (w *Worker) claimAndReprocess(ctx context.Context) {
+	args := &redis.XAutoClaimArgs{
+		Stream:   streamName,
+		Group:    groupName,
+		Consumer: w.Consumer,
+		MinIdle:  2 * time.Second,
+		Start:    "0-0",
+		Count:    10,
+	}
+
+	claimedMessages, _, err := w.db.XAutoClaim(ctx, args).Result()
+	if err != nil && !errors.Is(err, redis.Nil) {
+		log.Printf("[Janitor] Erro ao tentar reclamar mensagens: %v", err)
+		return
+	}
+
+	if len(claimedMessages) > 0 {
+		log.Printf(
+			"[Janitor] Reclamou %d mensagens pendentes para reprocessamento.",
+			len(claimedMessages),
+		)
+
+		var wg sync.WaitGroup
+		numWorkers := len(claimedMessages)
+
+		for i, msg := range claimedMessages {
+			wg.Add(1)
+			go func(workerID int, message redis.XMessage) {
+				defer wg.Done()
+				w.processClaimedMessage(ctx, message, workerID)
+			}(i, msg)
+		}
+
+		wg.Wait()
+		log.Printf("[Janitor] Finalizou processamento de %d mensagens.", numWorkers)
+	}
+}
+
+func (w *Worker) processClaimedMessage(ctx context.Context, msg redis.XMessage, workerID int) {
+	payload := msg.Values["payload"].(string)
+	var req PaymentRequest
+	if err := json.Unmarshal([]byte(payload), &req); err != nil {
+		log.Printf(
+			"[Janitor Worker %d] Erro ao decodificar payload de mensagem reclamada, descartando: %v",
+			workerID,
+			err,
+		)
+		w.db.XAck(ctx, streamName, groupName, msg.ID)
+		return
+	}
+
+	if err := w.processPayment(ctx, req); err != nil {
+		return
+	}
+
+	w.db.XAck(ctx, streamName, groupName, msg.ID)
 }
 
 func (w *Worker) createConsumerGroup(ctx context.Context) {
