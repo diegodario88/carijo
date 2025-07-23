@@ -1,6 +1,7 @@
 package cmd
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -77,12 +78,21 @@ func (s *HttpServer) registerRoutes() {
 }
 
 func (s *HttpServer) handlePayments(c fiber.Ctx) error {
-	var req common.PaymentRequest
-	if err := c.Bind().Body(&req); err != nil {
+	body := c.Body()
+	key := []byte(`"correlationId":"`)
+	start := bytes.Index(body, key)
+	if start == -1 {
 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "payload invalido"})
 	}
 
-	s.queue.Dispatch(req)
+	valueStart := start + len(key)
+	end := bytes.Index(body[valueStart:], []byte(`"`))
+	if end == -1 {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "payload invalido"})
+	}
+
+	correlationID := string(body[valueStart : valueStart+end])
+	s.queue.Dispatch(common.PaymentRequest{CorrelationID: correlationID})
 
 	return c.Status(fiber.StatusAccepted).SendString("")
 }

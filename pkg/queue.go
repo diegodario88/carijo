@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/diegodario88/carijo/pkg/common"
+	"github.com/shopspring/decimal"
 )
 
 type Job struct {
@@ -74,19 +75,19 @@ func (q *Queue) Dispatch(payment common.PaymentRequest) {
 func (q *Queue) Run(ctx context.Context) {
 	var wg sync.WaitGroup
 
-	for i := range q.concurrency {
+	for range q.concurrency {
 		wg.Add(1)
-		go func(workerID int) {
+		go func() {
 			defer wg.Done()
-			q.worker(ctx, workerID)
-		}(i)
+			q.worker(ctx)
+		}()
 	}
 
 	wg.Wait()
 	log.Println("Todos os workers da fila foram finalizados.")
 }
 
-func (q *Queue) worker(ctx context.Context, workerID int) {
+func (q *Queue) worker(ctx context.Context) {
 	for {
 		select {
 		case <-ctx.Done():
@@ -143,11 +144,12 @@ func (q *Queue) executeAndMonitor(
 	req common.PaymentRequest,
 ) error {
 	requestedAtTime := time.Now().UTC()
+	amount, _ := decimal.NewFromString(common.PaymentAmount)
 	requestedAtStr := requestedAtTime.Format(time.RFC3339Nano)
 
 	body := common.PaymentProcessorRequest{
 		CorrelationID: req.CorrelationID,
-		Amount:        req.Amount,
+		Amount:        amount,
 		RequestedAt:   requestedAtStr,
 	}
 	jsonBody, _ := json.Marshal(body)
