@@ -10,12 +10,12 @@ var (
 	Twin   string
 )
 
-const StreamName = "payments_stream"
-const GroupName = "payment_processors"
-const PaymentsHashKey = "payments"
-const MinIdleDuration = 2 * time.Second
-const ClaimUnprocessedCount = 100
-const CircuitBreakerTimeout = 1 * time.Second
+const (
+	CircuitBreakerTimeout = 800 * time.Millisecond
+	MaxRetries            = 5
+	RetryDelay            = 200 * time.Millisecond
+	PaymentAmount         = "19.90"
+)
 
 func init() {
 	Whoami, _ = os.Hostname()
