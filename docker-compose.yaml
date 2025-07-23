@@ -9,8 +9,6 @@ services:
       - black-carijo
     ports:
       - "9999:80"
-    tmpfs:
-      - /var/cache/nginx:size=50m
     networks:
       - rinha-net
     deploy:
