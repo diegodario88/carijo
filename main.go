@@ -9,9 +9,8 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/diegodario88/carijo/cmd/api"
-	"github.com/diegodario88/carijo/cmd/health"
-	"github.com/diegodario88/carijo/cmd/worker"
+	"github.com/diegodario88/carijo/cmd"
+	"github.com/diegodario88/carijo/pkg"
 	"github.com/redis/go-redis/v9"
 )
 
@@ -23,13 +22,15 @@ func main() {
 		Addr:     "storage:6379",
 		Password: "",
 		DB:       0,
-		PoolSize: 100,
+		PoolSize: 1000,
 	})
 
+	breakerStore := pkg.NewCircuitBreakerStore()
+	summaryStore := pkg.NewInMemorySummaryStore()
+
 	var wg sync.WaitGroup
-	httpServer := api.NewHttpServer(rdb)
-	paymentWorker := worker.NewPaymentWorker(rdb)
-	healthChecker := health.NewHealthChecker(rdb)
+	httpServer := cmd.NewHttpServer(rdb, summaryStore)
+	paymentWorker := cmd.NewPaymentWorker(rdb, breakerStore, summaryStore)
 
 	wg.Add(1)
 	go func() {
@@ -48,19 +49,11 @@ func main() {
 		log.Println("Worker desligado com sucesso.")
 	}()
 
-	if paymentWorker.Consumer == "white-carijo" {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			healthChecker.Run(ctx)
-		}()
-	} else {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			paymentWorker.RunJanitor(ctx)
-		}()
-	}
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		paymentWorker.RunJanitor(ctx)
+	}()
 
 	<-ctx.Done()
 
