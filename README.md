@@ -12,7 +12,6 @@ O projeto consiste em um intermediário de pagamentos que se comunica com dois s
 
 - **Linguagem:** [Go](https://go.dev/)
 - **Framework Web:** [Fiber](https://gofiber.io/)
-- **Banco de Dados:** [Redis](https://redis.io/) para armazenamento de filas e dados temporários.
 - **Load Balancer:** [Nginx](https://www.nginx.com/) para distribuir a carga entre as duas instâncias da aplicação.
 - **Conteinerização:** [Docker](https://www.docker.com/) e [Docker Compose](https://docs.docker.com/compose/).
 
@@ -22,9 +21,8 @@ A solução é composta por:
 
 - 2 instâncias da aplicação Go (`white-carijo` e `black-carijo`) que recebem as requisições de pagamento.
 - 1 instância do Nginx (`balancer`) que atua como load balancer.
-- 1 instância do Redis (`storage`) que funciona como fila para processamento assíncrono dos pagamentos.
 
-Um dos serviços Go (`white-carijo`) também é responsável por monitorar a saúde dos processadores de pagamento, enquanto o outro (`black-carijo`) executa uma tarefa de limpeza (janitor) para pagamentos que possam ter falhado.
+A aplicação utiliza uma **fila em memória** para processar os pagamentos de forma assíncrona. Para lidar com a instabilidade dos processadores de pagamento, foi implementado o padrão **Circuit Breaker**, que monitora a saúde dos serviços e evita chamadas para serviços que estão falhando.
 
 ## Como Executar
 
