@@ -11,11 +11,8 @@ import (
 	"github.com/diegodario88/carijo/pkg"
 	"github.com/diegodario88/carijo/pkg/common"
 	"github.com/gofiber/fiber/v3"
-	"github.com/redis/go-redis/v9"
 	"github.com/shopspring/decimal"
 )
-
-const paymentAmount = "19.90"
 
 type SummaryResponse struct {
 	Default struct {
@@ -35,20 +32,20 @@ type InternalSummaryResponse struct {
 
 type HttpServer struct {
 	port         string
-	db           *redis.Client
+	queue        *pkg.Queue
 	summaryStore *pkg.InMemorySummaryStore
 	app          *fiber.App
 	httpClient   *http.Client
 }
 
-func NewHttpServer(db *redis.Client, summaryStore *pkg.InMemorySummaryStore) *HttpServer {
+func NewHttpServer(queue *pkg.Queue, summaryStore *pkg.InMemorySummaryStore) *HttpServer {
 	app := fiber.New(fiber.Config{
 		IdleTimeout: 5 * time.Second,
 	})
 
 	s := &HttpServer{
 		port:         ":3000",
-		db:           db,
+		queue:        queue,
 		summaryStore: summaryStore,
 		app:          app,
 		httpClient: &http.Client{
@@ -84,16 +81,8 @@ func (s *HttpServer) handlePayments(c fiber.Ctx) error {
 	if err := c.Bind().Body(&req); err != nil {
 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "payload invalido"})
 	}
-	payload, _ := json.Marshal(req)
-	args := &redis.XAddArgs{
-		Stream: common.StreamName,
-		Values: map[string]any{"payload": payload},
-	}
-	if err := s.db.XAdd(c.Context(), args).Err(); err != nil {
-		log.Printf("Erro ao adicionar na stream: %v", err)
-		return c.Status(fiber.StatusInternalServerError).
-			JSON(fiber.Map{"error": "falha ao enfileirar"})
-	}
+
+	s.queue.Dispatch(req)
 
 	return c.Status(fiber.StatusAccepted).SendString("")
 }
@@ -124,7 +113,7 @@ func (s *HttpServer) handleGetSummary(c fiber.Ctx) error {
 		totalFallback += remoteSummary.FallbackCount
 	}
 
-	amountDecimal, _ := decimal.NewFromString(paymentAmount)
+	amountDecimal, _ := decimal.NewFromString(common.PaymentAmount)
 	defaultAmount, _ := decimal.NewFromInt(totalDefault).Mul(amountDecimal).Float64()
 	fallbackAmount, _ := decimal.NewFromInt(totalFallback).Mul(amountDecimal).Float64()
 

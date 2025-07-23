@@ -5,32 +5,29 @@ import (
 	"log"
 	"net/http"
 	"os/signal"
+	"strconv"
 	"sync"
 	"syscall"
 	"time"
 
 	"github.com/diegodario88/carijo/cmd"
 	"github.com/diegodario88/carijo/pkg"
-	"github.com/redis/go-redis/v9"
+	"github.com/diegodario88/carijo/pkg/common"
 )
 
 func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
-	rdb := redis.NewClient(&redis.Options{
-		Addr:     "storage:6379",
-		Password: "",
-		DB:       0,
-		PoolSize: 1000,
-	})
-
 	breakerStore := pkg.NewCircuitBreakerStore()
 	summaryStore := pkg.NewInMemorySummaryStore()
 
+	concurrency, _ := strconv.Atoi(common.GetEnv("WORKER_CONCURRENCY", "7"))
+	log.Printf("Iniciando com %v trabalhadores", concurrency)
+	queue := pkg.NewQueue(20000, concurrency, breakerStore, summaryStore)
+
 	var wg sync.WaitGroup
-	httpServer := cmd.NewHttpServer(rdb, summaryStore)
-	paymentWorker := cmd.NewPaymentWorker(rdb, breakerStore, summaryStore)
+	httpServer := cmd.NewHttpServer(queue, summaryStore)
 
 	wg.Add(1)
 	go func() {
@@ -43,16 +40,7 @@ func main() {
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		if err := paymentWorker.Run(ctx); err != nil {
-			log.Printf("Worker foi finalizado com erro: %v", err)
-		}
-		log.Println("Worker desligado com sucesso.")
-	}()
-
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		paymentWorker.RunJanitor(ctx)
+		queue.Run(ctx)
 	}()
 
 	<-ctx.Done()
@@ -70,11 +58,6 @@ func main() {
 
 	log.Println("Aguardando todos os serviços finalizarem...")
 	wg.Wait()
-
-	log.Println("Desligando cliente Redis...")
-	if err := rdb.Close(); err != nil {
-		log.Printf("Erro ao fechar conexão com Redis: %v", err)
-	}
 
 	log.Println("Processo de desligamento foi completo com sucesso!")
 }
